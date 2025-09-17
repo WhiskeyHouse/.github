@@ -59,7 +59,3 @@ See CONTRIBUTING.md for more details (if available).
 Email: pmannion@whiskeyhouse.com
 	•	General Inquiries
 Website: whiskeyhouse.com
-
-⸻
-
-Would you like me to make this general org-level README (for the top of your GitHub org), or do you want it tailored for a specific repo (like your whk-wms-backend)?
