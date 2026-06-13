@@ -1,0 +1,61 @@
+name: Lockfile Sync Check (reusable)
+
+# Org-wide reusable gate: fails when a repo's package-lock.json drifts from any
+# workspace package.json (the condition that makes `npm ci` fail). Call it from
+# any WhiskeyHouse Node repo with a tiny caller workflow:
+#
+#   # .github/workflows/lockfile-sync-check.yml in the consumer repo
+#   name: Lockfile Sync Check
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
+#   jobs:
+#     lockfile:
+#       uses: WhiskeyHouse/.github/.github/workflows/lockfile-sync-check.yml@main
+#
+# Pin @main to a tag or SHA once stable. The validator script is vendored in
+# THIS repo (scripts/validate-lockfile-sync.js) — consumer repos need no script.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version used to run the validator"
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-lockfile:
+    name: Validate package-lock.json sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      # 1. The caller repo lands in $GITHUB_WORKSPACE (the default checkout).
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      # 2. Fetch only the validator script from this org repo, into a side path
+      #    so it never collides with the caller's tree.
+      - name: Fetch lockfile validator
+        uses: actions/checkout@v4
+        with:
+          repository: WhiskeyHouse/.github
+          ref: main
+          path: .lockfile-validator
+          sparse-checkout: |
+            scripts/validate-lockfile-sync.js
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # 3. Validate the caller repo (github.workspace) using the org script.
+      - name: Validate lockfile sync
+        run: node .lockfile-validator/scripts/validate-lockfile-sync.js "${{ github.workspace }}"
