@@ -38,6 +38,8 @@ jobs:
       # 1. The caller repo lands in $GITHUB_WORKSPACE (the default checkout).
       - name: Checkout caller repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # 2. Fetch only the validator script from this org repo, into a side path
       #    so it never collides with the caller's tree.

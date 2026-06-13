@@ -45,6 +45,12 @@ if (!fs.existsSync(lockFilePath)) {
 }
 
 const lockFile = readJson(lockFilePath);
+
+if (!fs.existsSync(rootPkgPath)) {
+  console.error(`❌ No package.json found at ${rootDir}.`);
+  process.exit(1);
+}
+
 const rootPkg = readJson(rootPkgPath);
 
 if (!lockFile.packages) {
@@ -54,6 +60,13 @@ if (!lockFile.packages) {
       '(npm 7+). Regenerate with `npm install`.',
   );
   process.exit(1);
+}
+
+// Canonicalize a workspace path to the form npm stores in package-lock.json's
+// `packages` keys: no leading "./", no trailing "/". Without this, workspaces
+// declared as "./apps/foo" or "apps/foo/" would miss the exact-match lookup.
+function normalizeWorkspaceKey(p) {
+  return path.posix.normalize(p).replace(/^\.\//, '').replace(/\/+$/, '');
 }
 
 /**
@@ -77,11 +90,11 @@ function resolveWorkspaces(pkg) {
         if (!entry.isDirectory()) continue;
         const rel = path.posix.join(prefix, entry.name);
         if (fs.existsSync(path.join(rootDir, rel, 'package.json'))) {
-          dirs.push(rel);
+          dirs.push(normalizeWorkspaceKey(rel));
         }
       }
     } else if (fs.existsSync(path.join(rootDir, pattern, 'package.json'))) {
-      dirs.push(pattern);
+      dirs.push(normalizeWorkspaceKey(pattern));
     }
   }
   return dirs;
