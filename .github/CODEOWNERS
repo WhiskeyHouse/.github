@@ -1,0 +1,4 @@
+# Whiskey House — default code owners (ISO 27001 A.8.2 / A.8.4)
+# Every PR to the default branch requires review from a human Technology team member.
+# CodeRabbit and other bot apps are NOT members of this team and cannot satisfy this gate.
+* @WhiskeyHouse/technology
