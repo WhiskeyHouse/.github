@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+# CodeRabbit configuration — Whiskey House ISO 27001 baseline.
+# request_changes_workflow: false (the default, pinned explicitly) => CodeRabbit will
+# NEVER auto-approve a PR. A human Technology code-owner approval is therefore always
+# required (enforced structurally by CODEOWNERS + org ruleset require_code_owner_review).
+# Only verified schema keys are used here to avoid breaking CodeRabbit on deploy.
+reviews:
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
