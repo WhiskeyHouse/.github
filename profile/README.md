@@ -4,8 +4,6 @@
 
 **Build cool stuff - make great whiskey**
 
-Distillery and innovation hub in Bardstown, Kentucky
-
 [![Website](https://img.shields.io/badge/website-whiskeyhouse.com-8B4513?style=flat)](https://whiskeyhouse.com)
 [![ignition-mcp stars](https://img.shields.io/github/stars/WhiskeyHouse/ignition-mcp?style=flat&label=ignition-mcp%20stars)](https://github.com/WhiskeyHouse/ignition-mcp)
 
