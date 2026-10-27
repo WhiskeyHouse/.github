@@ -25,7 +25,7 @@ Repositories in this organization typically fall into these categories:
 🚀 Getting Started
 	1.	Clone a Repository
 
-git clone https://github.com/Whiskey-House-Kentucky/<repo-name>.git
+git clone https://github.com/WhiskeyHouse/<repo-name>.git
 cd <repo-name>
 
 
