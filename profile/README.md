@@ -44,9 +44,8 @@ open-source project, with 42 stars.
 
 ## 🥃 Who We Are
 
-Whiskey House of Kentucky (WHK) is a distillery and innovation hub in Bardstown, Kentucky. We combine
-traditional craftsmanship with modern digital technology to support our operations, manufacturing, and
-customer engagement.
+Whiskey House of Kentucky (WHK) combines traditional craftsmanship with modern digital technology to support our
+operations, manufacturing, and customer engagement.
 
 ## 🏭 What Engineering & Technology (ENT) Builds
 
@@ -121,5 +120,5 @@ We welcome contributions from team members and approved partners.
 ---
 
 <div align="center">
-<sub>Built in Bardstown, Kentucky 🥃</sub>
+<sub>Built at Whiskey House 🥃</sub>
 </div>
