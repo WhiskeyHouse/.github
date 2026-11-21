@@ -1,0 +1,285 @@
+name: Code Health (reusable)
+
+# Org-wide advisory code-health workflow supporting TypeScript/JS, Python, and Rust,
+# plus agent-harness hygiene (AGENTS.md budget & CLAUDE.md symlink check).
+#
+# Call from any WhiskeyHouse repo with a minimal caller workflow:
+#
+#   name: Code Health (Advisory)
+#   on:
+#     pull_request:
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#   jobs:
+#     code-health:
+#       uses: WhiskeyHouse/.github/.github/workflows/code-health.yml@main
+#       with:
+#         paths: "apps/my-api/src apps/my-ui/src"   # optional; defaults to "."
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Space-separated paths to scan (default: repo root)"
+        type: string
+        default: "."
+      node-version:
+        description: "Node.js version for jscpd / knip"
+        type: string
+        default: "22"
+      python-version:
+        description: "Python version for ruff / vulture"
+        type: string
+        default: "3.12"
+      min-clone-lines:
+        description: "Minimum lines for jscpd clone detection"
+        type: number
+        default: 15
+      min-clone-tokens:
+        description: "Minimum tokens for jscpd clone detection"
+        type: number
+        default: 80
+      max-agents-md-lines:
+        description: "Advisory max line budget for root AGENTS.md"
+        type: number
+        default: 200
+      run-clippy:
+        description: "Also run cargo clippy complexity/dead_code checks on Rust repos"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  code-health:
+    name: Code Health (Advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect languages & PR-changed files
+        id: detect
+        shell: bash
+        run: |
+          HAS_TS=false
+          HAS_PY=false
+          HAS_RS=false
+          [ -f package.json ] && HAS_TS=true
+          if [ -f pyproject.toml ] || [ -f requirements.txt ] || find . -maxdepth 3 -name "*.py" -not -path "*/.git/*" -print -quit | grep -q .; then
+            HAS_PY=true
+          fi
+          [ -f Cargo.toml ] && HAS_RS=true
+
+          echo "has_ts=$HAS_TS" >> "$GITHUB_OUTPUT"
+          echo "has_py=$HAS_PY" >> "$GITHUB_OUTPUT"
+          echo "has_rs=$HAS_RS" >> "$GITHUB_OUTPUT"
+
+          CHANGED_FILE_LIST="/tmp/pr-changed-files.txt"
+          : > "$CHANGED_FILE_LIST"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}"...HEAD > "$CHANGED_FILE_LIST" || true
+          fi
+          echo "changed_count=$(wc -l < "$CHANGED_FILE_LIST" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Code Health Summary (Advisory)"
+            echo ""
+            echo "- **Languages detected:** TS/JS=\`$HAS_TS\`, Python=\`$HAS_PY\`, Rust=\`$HAS_RS\`"
+            echo "- **Scope:** $([ -s "$CHANGED_FILE_LIST" ] && echo "PR-changed files ($(wc -l < "$CHANGED_FILE_LIST" | tr -d ' '))" || echo "Full scan (\`${{ inputs.paths }}\`)")"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Agent harness hygiene check
+        shell: bash
+        run: |
+          MAX_LINES="${{ inputs.max-agents-md-lines }}"
+          WARNINGS=()
+
+          if [ -f AGENTS.md ]; then
+            LINES=$(wc -l < AGENTS.md | tr -d ' ')
+            if [ "$LINES" -gt "$MAX_LINES" ]; then
+              WARNINGS+=("AGENTS.md is ${LINES} lines (budget: <=${MAX_LINES}). Extract deep runbooks to docs/ or skills.")
+            fi
+          fi
+
+          if [ -f AGENTS.md ] && [ -e CLAUDE.md ] && [ ! -L CLAUDE.md ]; then
+            WARNINGS+=("CLAUDE.md exists as a separate file alongside AGENTS.md. Symlink CLAUDE.md -> AGENTS.md to prevent drift.")
+          fi
+
+          if [ -f .windsurfrules ]; then
+            WARNINGS+=("Legacy .windsurfrules file is still present; consolidate active rules into AGENTS.md and delete it.")
+          fi
+
+          {
+            echo "### Agent Harness Hygiene"
+            if [ "${#WARNINGS[@]}" -eq 0 ]; then
+              echo "- Pass: no harness drift or budget warnings."
+            else
+              for w in "${WARNINGS[@]}"; do
+                echo "- Warning: $w"
+              done
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js (jscpd / knip)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Copy-paste duplication (jscpd — TS/JS, Python, Rust)
+        shell: bash
+        run: |
+          mkdir -p /tmp/jscpd-out
+          JSCPD_ARGS=(
+            ${{ inputs.paths }}
+            --min-lines "${{ inputs.min-clone-lines }}"
+            --min-tokens "${{ inputs.min-clone-tokens }}"
+            --format "typescript,tsx,javascript,jsx,python,rust"
+            --reporters json
+            --output /tmp/jscpd-out
+            --silent
+          )
+          if [ -f .jscpd.json ]; then
+            JSCPD_ARGS+=(--config .jscpd.json)
+          else
+            JSCPD_ARGS+=(--ignore "**/node_modules/**,**/dist/**,**/.next/**,**/.turbo/**,**/target/**,**/coverage/**,**/generated/**,**/prisma/migrations/**,**/*.spec.*,**/*.test.*,**/__tests__/**,**/__mocks__/**")
+          fi
+
+          npx --yes jscpd@4 "${JSCPD_ARGS[@]}" || true
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          report = Path("/tmp/jscpd-out/jscpd-report.json")
+          changed = {l.strip() for l in Path("/tmp/pr-changed-files.txt").read_text().splitlines() if l.strip()}
+
+          print("### Copy-Paste Duplication (jscpd)")
+          if not report.exists():
+              print("- No jscpd report generated.\n")
+              raise SystemExit(0)
+
+          data = json.loads(report.read_text())
+          dups = data.get("duplicates", [])
+          if changed:
+              dups = [
+                  d for d in dups
+                  if d.get("firstFile", {}).get("name", "").lstrip("./") in changed
+                  or d.get("secondFile", {}).get("name", "").lstrip("./") in changed
+              ]
+
+          if not dups:
+              print("- Pass: no clones found in scope.\n")
+          else:
+              print(f"- Found **{len(dups)}** clone pair(s) in scope (showing up to 20):\n")
+              print("| File A | File B | Lines |")
+              print("|---|---|---:|")
+              for d in dups[:20]:
+                  a = d.get("firstFile", {})
+                  b = d.get("secondFile", {})
+                  af = f"`{a.get('name', '?')}:{a.get('start', '?')}-{a.get('end', '?')}`"
+                  bf = f"`{b.get('name', '?')}:{b.get('start', '?')}-{b.get('end', '?')}`"
+                  print(f"| {af} | {bf} | {d.get('lines', '?')} |")
+              print("")
+          PY
+
+      - name: TypeScript/JS dead code & unused exports (knip)
+        if: steps.detect.outputs.has_ts == 'true'
+        shell: bash
+        run: |
+          KNIP_ARGS=(--no-exit-code)
+          [ -f knip.json ] && KNIP_ARGS+=(--config knip.json)
+          npx --yes knip@5 "${KNIP_ARGS[@]}" > /tmp/knip-out.txt 2>&1 || true
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+
+          lines = Path("/tmp/knip-out.txt").read_text(errors="replace").splitlines()
+          changed = {l.strip() for l in Path("/tmp/pr-changed-files.txt").read_text().splitlines() if l.strip()}
+
+          print("### TypeScript / JS Dead Code (knip)")
+          if changed:
+              matched = [l for l in lines if any(c in l for c in changed)]
+              if not matched:
+                  print("- Pass: no unused files/exports reported in PR-changed files.\n")
+              else:
+                  print("```")
+                  for l in matched[:80]:
+                      print(l)
+                  print("```\n")
+          else:
+              print("```")
+              for l in lines[:80]:
+                  print(l)
+              print("```\n")
+          PY
+
+      - name: Setup Python (ruff / vulture)
+        if: steps.detect.outputs.has_py == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Python dead code & complexity (ruff + vulture)
+        if: steps.detect.outputs.has_py == 'true'
+        shell: bash
+        run: |
+          pip install --quiet ruff vulture
+          PY_TARGETS=""
+          if [ -s /tmp/pr-changed-files.txt ]; then
+            PY_TARGETS=$(grep '\.py$' /tmp/pr-changed-files.txt || true)
+          else
+            PY_TARGETS="${{ inputs.paths }}"
+          fi
+
+          {
+            echo "### Python Dead Code & Complexity (ruff + vulture)"
+            if [ -z "$PY_TARGETS" ]; then
+              echo "- Skipped: no Python files changed in this PR."
+            else
+              echo '```'
+              echo "--- ruff (F401 unused imports, F841 unused vars, C901 complexity) ---"
+              ruff check --select F401,F841,C901 $PY_TARGETS | head -n 60 || true
+              echo "--- vulture (min-confidence 80) ---"
+              vulture --min-confidence 80 $PY_TARGETS | head -n 60 || true
+              echo '```'
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install cargo-machete (Rust unused dependencies)
+        if: steps.detect.outputs.has_rs == 'true'
+        uses: taiki-e/install-action@cargo-machete
+
+      - name: Rust unused dependencies (cargo-machete)
+        if: steps.detect.outputs.has_rs == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### Rust Unused Dependencies (cargo-machete)"
+            echo '```'
+            cargo-machete || true
+            echo '```'
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rust dead code & complexity (clippy, opt-in)
+        if: steps.detect.outputs.has_rs == 'true' && inputs.run-clippy
+        shell: bash
+        run: |
+          {
+            echo "### Rust Dead Code & Complexity (clippy)"
+            echo '```'
+            cargo clippy --all-targets -- -W dead_code -W clippy::cognitive_complexity -W clippy::too_many_lines 2>&1 | tail -n 80 || true
+            echo '```'
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
