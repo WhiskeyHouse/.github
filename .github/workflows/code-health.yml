@@ -1,0 +1,559 @@
+name: Code Health (reusable)
+
+# Org-wide advisory code-health workflow supporting TypeScript/JS, Python, and Rust,
+# plus agent-harness hygiene (AGENTS.md budget & CLAUDE.md symlink check).
+#
+# Call from any WhiskeyHouse repo with a minimal caller workflow:
+#
+#   name: Code Health (Advisory)
+#   on:
+#     pull_request:
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#   jobs:
+#     code-health:
+#       uses: WhiskeyHouse/.github/.github/workflows/code-health.yml@main
+#       with:
+#         paths: "apps/my-api/src apps/my-ui/src"   # optional; defaults to "."
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Space-separated paths to scan (default: repo root)"
+        type: string
+        default: "."
+      node-version:
+        description: "Node.js version for jscpd / knip"
+        type: string
+        default: "22"
+      python-version:
+        description: "Python version for ruff / vulture"
+        type: string
+        default: "3.12"
+      min-clone-lines:
+        description: "Minimum lines for jscpd clone detection"
+        type: number
+        default: 15
+      min-clone-tokens:
+        description: "Minimum tokens for jscpd clone detection"
+        type: number
+        default: 80
+      max-agents-md-lines:
+        description: "Advisory max line budget for root AGENTS.md"
+        type: number
+        default: 200
+      run-clippy:
+        description: "Also run cargo clippy complexity/dead_code checks on Rust repos"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  code-health:
+    name: Code Health (Advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect languages, manifests, & PR-changed files in scope
+        id: detect
+        shell: bash
+        env:
+          SCAN_PATHS: ${{ inputs.paths }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, shlex, subprocess
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          raw_paths = shlex.split(os.environ.get("SCAN_PATHS", ".")) or ["."]
+          scan_paths = []
+          for p in raw_paths:
+              norm = os.path.normpath(p)
+              scan_paths.append("." if norm in ("", ".") else norm)
+
+          def in_scope(rel_path: str) -> bool:
+              norm = os.path.normpath(rel_path)
+              if "." in scan_paths:
+                  return True
+              for sp in scan_paths:
+                  if norm == sp or norm.startswith(sp + "/"):
+                      return True
+              return False
+
+          # 1. PR-changed files intersected with scan_paths
+          is_pr = os.environ.get("EVENT_NAME") == "pull_request" and bool(os.environ.get("BASE_SHA"))
+          changed_all = []
+          if is_pr:
+              res = subprocess.run(
+                  ["git", "diff", "-z", "--name-only", "--diff-filter=ACMR", f"{os.environ['BASE_SHA']}...HEAD"],
+                  capture_output=True, text=True
+              )
+              changed_all = [x for x in res.stdout.split("\0") if x]
+
+          changed_in_scope = [f for f in changed_all if in_scope(f)]
+
+          # 2. Discover JS/TS and Rust project roots (root manifest OR nested manifests within scan_paths)
+          skip_dirs = {".git", "node_modules", "dist", ".next", ".turbo", "target", "coverage", ".venv", "venv"}
+
+          def find_project_roots(manifest_name: str):
+              # If root manifest exists, it anchors monorepos/workspaces
+              if (repo_root / manifest_name).is_file():
+                  return ["."]
+              found = set()
+              for sp in scan_paths:
+                  base = (repo_root / sp).resolve()
+                  if not base.exists():
+                      continue
+                  # Walk up to check if scan_path sits inside a parent project
+                  cur = base if base.is_dir() else base.parent
+                  while cur != repo_root and repo_root in cur.parents:
+                      if (cur / manifest_name).is_file():
+                          found.add(str(cur.relative_to(repo_root)))
+                          break
+                      cur = cur.parent
+                  # Walk down to find nested manifests
+                  if base.is_dir():
+                      for dp, dirnames, filenames in os.walk(base):
+                          dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                          if manifest_name in filenames:
+                              rel = str(Path(dp).relative_to(repo_root))
+                              found.add("." if rel == "" else rel)
+                              dirnames[:] = []  # don't descend into nested workspaces of the same manifest
+              return sorted(found)
+
+          ts_roots = find_project_roots("package.json")
+          rs_roots = find_project_roots("Cargo.toml")
+
+          # Python detection within scan_paths
+          has_py = False
+          if (repo_root / "pyproject.toml").is_file() or (repo_root / "requirements.txt").is_file():
+              has_py = True
+          else:
+              for sp in scan_paths:
+                  base = repo_root / sp
+                  if not base.exists():
+                      continue
+                  if base.is_file() and base.suffix == ".py":
+                      has_py = True
+                      break
+                  if base.is_dir():
+                      for dp, dirnames, filenames in os.walk(base):
+                          dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                          if any(f.endswith(".py") for f in filenames):
+                              has_py = True
+                              break
+                  if has_py:
+                      break
+
+          state = {
+              "is_pr": is_pr,
+              "scan_paths": scan_paths,
+              "changed_in_scope": changed_in_scope,
+              "ts_roots": ts_roots,
+              "rs_roots": rs_roots,
+              "has_py": has_py,
+          }
+          Path("/tmp/code-health-state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"has_ts={'true' if ts_roots else 'false'}\n")
+              out.write(f"has_py={'true' if has_py else 'false'}\n")
+              out.write(f"has_rs={'true' if rs_roots else 'false'}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write("## Code Health Summary (Advisory)\n\n")
+              s.write(f"- **Languages detected:** TS/JS=`{bool(ts_roots)}` (roots: `{ts_roots}`), Python=`{has_py}`, Rust=`{bool(rs_roots)}` (roots: `{rs_roots}`)\n")
+              if is_pr:
+                  s.write(f"- **Scope:** PR-changed files in `{scan_paths}` ({len(changed_in_scope)} file(s))\n\n")
+              else:
+                  s.write(f"- **Scope:** Full scan (`{scan_paths}`)\n\n")
+          PY
+
+      - name: Agent harness hygiene check
+        continue-on-error: true
+        shell: bash
+        run: |
+          MAX_LINES="${{ inputs.max-agents-md-lines }}"
+          WARNINGS=()
+
+          if [ -f AGENTS.md ]; then
+            LINES=$(wc -l < AGENTS.md | tr -d ' ')
+            if [ "$LINES" -gt "$MAX_LINES" ]; then
+              WARNINGS+=("AGENTS.md is ${LINES} lines (budget: <=${MAX_LINES}). Extract deep runbooks to docs/ or skills.")
+            fi
+          fi
+
+          if [ -f AGENTS.md ] && [ -e CLAUDE.md ] && [ ! -L CLAUDE.md ]; then
+            WARNINGS+=("CLAUDE.md exists as a separate file alongside AGENTS.md. Symlink CLAUDE.md -> AGENTS.md to prevent drift.")
+          fi
+
+          if [ -f .windsurfrules ]; then
+            WARNINGS+=("Legacy .windsurfrules file is still present; consolidate active rules into AGENTS.md and delete it.")
+          fi
+
+          {
+            echo "### Agent Harness Hygiene"
+            if [ "${#WARNINGS[@]}" -eq 0 ]; then
+              echo "- Pass: no harness drift or budget warnings."
+            else
+              for w in "${WARNINGS[@]}"; do
+                echo "- Warning: $w"
+              done
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js (jscpd / knip)
+        continue-on-error: true
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Copy-paste duplication (jscpd — TS/JS, Python, Rust)
+        continue-on-error: true
+        shell: bash
+        env:
+          MIN_LINES: ${{ inputs.min-clone-lines }}
+          MIN_TOKENS: ${{ inputs.min-clone-tokens }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, subprocess
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          state = json.loads(Path("/tmp/code-health-state.json").read_text())
+          scan_paths = state["scan_paths"]
+          is_pr = state["is_pr"]
+          changed = set(state["changed_in_scope"])
+
+          print("### Copy-Paste Duplication (jscpd)")
+          if is_pr and not changed:
+              print("- Skipped: no files changed within configured scan paths.\n")
+              raise SystemExit(0)
+
+          out_dir = Path("/tmp/jscpd-out")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          cmd = [
+              "npx", "--yes", "jscpd@4",
+              *scan_paths,
+              "--min-lines", str(os.environ["MIN_LINES"]),
+              "--min-tokens", str(os.environ["MIN_TOKENS"]),
+              "--format", "typescript,tsx,javascript,jsx,python,rust",
+              "--reporters", "json",
+              "--output", str(out_dir),
+              "--silent",
+          ]
+          if (repo_root / ".jscpd.json").is_file():
+              cmd += ["--config", ".jscpd.json"]
+          else:
+              cmd += [
+                  "--ignore",
+                  "**/node_modules/**,**/dist/**,**/.next/**,**/.turbo/**,**/target/**,**/coverage/**,**/generated/**,**/prisma/migrations/**,**/*.spec.*,**/*.test.*,**/__tests__/**,**/__mocks__/**",
+              ]
+
+          proc = subprocess.run(cmd, capture_output=True, text=True)
+          report = out_dir / "jscpd-report.json"
+          if not report.exists():
+              diag = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip().splitlines()[-10:]
+              print(f"- Unavailable: jscpd failed (exit {proc.returncode}).\n```\n" + "\n".join(diag) + "\n```\n")
+              raise SystemExit(0)
+
+          def normalize_rel(name: str) -> str:
+              p = Path(name)
+              if p.is_absolute():
+                  try:
+                      return p.resolve().relative_to(repo_root).as_posix()
+                  except ValueError:
+                      return p.as_posix()
+              return os.path.normpath(name).replace("\\", "/")
+
+          data = json.loads(report.read_text())
+          dups = data.get("duplicates", [])
+          filtered = []
+          for d in dups:
+              a_name = normalize_rel(d.get("firstFile", {}).get("name", ""))
+              b_name = normalize_rel(d.get("secondFile", {}).get("name", ""))
+              if is_pr and (a_name not in changed and b_name not in changed):
+                  continue
+              filtered.append((a_name, d.get("firstFile", {}), b_name, d.get("secondFile", {}), d.get("lines", "?")))
+
+          if not filtered:
+              print("- Pass: no clones found in scope.\n")
+          else:
+              print(f"- Found **{len(filtered)}** clone pair(s) in scope (showing up to 20):\n")
+              print("| File A | File B | Lines |")
+              print("|---|---|---:|")
+              for a_name, a, b_name, b, lines in filtered[:20]:
+                  print(f"| `{a_name}:{a.get('start', '?')}-{a.get('end', '?')}` | `{b_name}:{b.get('start', '?')}-{b.get('end', '?')}` | {lines} |")
+              print("")
+          PY
+
+      - name: TypeScript/JS dead code & unused exports (knip)
+        if: steps.detect.outputs.has_ts == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, subprocess
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          state = json.loads(Path("/tmp/code-health-state.json").read_text())
+          is_pr = state["is_pr"]
+          changed = set(state["changed_in_scope"])
+          scan_paths = state["scan_paths"]
+          ts_roots = state["ts_roots"]
+
+          print("### TypeScript / JS Dead Code (knip)")
+          ts_exts = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"}
+          if is_pr and not any(Path(f).suffix in ts_exts for f in changed):
+              print("- Skipped: no JS/TS files changed in scope.\n")
+              raise SystemExit(0)
+
+          def in_scan_scope(rel_path: str) -> bool:
+              norm = os.path.normpath(rel_path)
+              if "." in scan_paths:
+                  return True
+              return any(norm == sp or norm.startswith(sp + "/") for sp in scan_paths)
+
+          def install_deps(proj_dir: Path):
+              if (proj_dir / "node_modules").exists():
+                  return True, ""
+              if (proj_dir / "pnpm-lock.yaml").is_file():
+                  cmd = ["npx", "--yes", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+              elif (proj_dir / "yarn.lock").is_file():
+                  cmd = ["yarn", "install", "--frozen-lockfile", "--ignore-scripts"]
+              elif (proj_dir / "package-lock.json").is_file():
+                  cmd = ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+              else:
+                  cmd = ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"]
+              r = subprocess.run(cmd, cwd=proj_dir, capture_output=True, text=True)
+              return r.returncode == 0, (r.stderr or r.stdout or "")
+
+          for root_rel in ts_roots:
+              proj_dir = (repo_root / root_rel).resolve()
+              ok_install, install_err = install_deps(proj_dir)
+              if not ok_install:
+                  tail = install_err.strip().splitlines()[-8:]
+                  print(f"- Unavailable (`{root_rel}`): dependency install failed before Knip.\n```\n" + "\n".join(tail) + "\n```\n")
+                  continue
+
+              cmd = ["npx", "--yes", "knip@5", "--reporter", "json", "--no-exit-code"]
+              if (proj_dir / "knip.json").is_file():
+                  cmd += ["--config", "knip.json"]
+              elif (proj_dir / "knip.jsonc").is_file():
+                  cmd += ["--config", "knip.jsonc"]
+
+              proc = subprocess.run(cmd, cwd=proj_dir, capture_output=True, text=True)
+              try:
+                  data = json.loads(proc.stdout)
+              except Exception:
+                  diag = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip().splitlines()[-12:]
+                  print(f"- Unavailable (`{root_rel}`): Knip did not produce valid JSON (exit {proc.returncode}).\n```\n" + "\n".join(diag) + "\n```\n")
+                  continue
+
+              def to_repo_rel(file_path: str) -> str:
+                  p = (proj_dir / file_path).resolve()
+                  try:
+                      return p.relative_to(repo_root).as_posix()
+                  except ValueError:
+                      return os.path.normpath(file_path)
+
+              unused_files = [to_repo_rel(f) for f in data.get("files", [])]
+              issues = []
+              for f in unused_files:
+                  if not in_scan_scope(f):
+                      continue
+                  if is_pr and f not in changed:
+                      continue
+                  issues.append(f"unused file: {f}")
+
+              for entry in data.get("issues", []):
+                  f = to_repo_rel(entry.get("file", ""))
+                  if not in_scan_scope(f):
+                      continue
+                  if is_pr and f not in changed:
+                      continue
+                  for kind in ("exports", "types", "duplicates", "enumMembers", "classMembers", "dependencies", "devDependencies", "unlisted"):
+                      items = entry.get(kind) or []
+                      if isinstance(items, dict):
+                          names = list(items.keys())
+                      else:
+                          names = [x.get("name", str(x)) if isinstance(x, dict) else str(x) for x in items]
+                      if names:
+                          issues.append(f"{f} [{kind}]: {', '.join(names[:8])}")
+
+              if not issues:
+                  print(f"- Pass (`{root_rel}`): no unused files/exports in scope.\n")
+              else:
+                  print(f"- Found **{len(issues)}** item(s) in `{root_rel}` (showing up to 60):\n```")
+                  for line in issues[:60]:
+                      print(line)
+                  print("```\n")
+          PY
+
+      - name: Setup Python (ruff / vulture)
+        if: steps.detect.outputs.has_py == 'true'
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Python dead code & complexity (ruff + vulture)
+        if: steps.detect.outputs.has_py == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          if ! pip install --quiet ruff vulture; then
+            echo -e "### Python Dead Code & Complexity (ruff + vulture)\n- Unavailable: failed to install ruff/vulture.\n" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, subprocess
+          from pathlib import Path
+
+          state = json.loads(Path("/tmp/code-health-state.json").read_text())
+          is_pr = state["is_pr"]
+          scan_paths = state["scan_paths"]
+          py_targets = [f for f in state["changed_in_scope"] if f.endswith(".py")] if is_pr else scan_paths
+
+          print("### Python Dead Code & Complexity (ruff + vulture)")
+          if is_pr and not py_targets:
+              print("- Skipped: no Python files changed in scope.\n")
+              raise SystemExit(0)
+
+          ruff = subprocess.run(["ruff", "check", "--select", "F401,F841,C901", *py_targets], capture_output=True, text=True)
+          vulture = subprocess.run(["vulture", "--min-confidence", "80", *py_targets], capture_output=True, text=True)
+          out_lines = []
+          if ruff.stdout.strip():
+              out_lines.append("--- ruff (F401 unused imports, F841 unused vars, C901 complexity) ---")
+              out_lines.extend(ruff.stdout.strip().splitlines()[:60])
+          if vulture.stdout.strip():
+              out_lines.append("--- vulture (min-confidence 80) ---")
+              out_lines.extend(vulture.stdout.strip().splitlines()[:60])
+
+          if not out_lines:
+              print("- Pass: no dead code or complexity warnings in scope.\n")
+          else:
+              print("```")
+              print("\n".join(out_lines))
+              print("```\n")
+          PY
+
+      - name: Install cargo-machete (Rust unused dependencies)
+        if: steps.detect.outputs.has_rs == 'true'
+        continue-on-error: true
+        uses: taiki-e/install-action@cargo-machete
+
+      - name: Rust unused dependencies & optional clippy (scoped)
+        if: steps.detect.outputs.has_rs == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          RUN_CLIPPY: ${{ inputs.run-clippy }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, shutil, subprocess
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          state = json.loads(Path("/tmp/code-health-state.json").read_text())
+          is_pr = state["is_pr"]
+          changed = set(state["changed_in_scope"])
+          rs_roots = state["rs_roots"]
+          run_clippy = os.environ.get("RUN_CLIPPY") == "true"
+
+          rs_changed = [f for f in changed if f.endswith(".rs") or Path(f).name in ("Cargo.toml", "Cargo.lock")]
+
+          print("### Rust Code Health (cargo-machete" + (" + clippy" if run_clippy else "") + ")")
+          if is_pr and not rs_changed:
+              print("- Skipped: no Rust files or Cargo manifests changed in scope.\n")
+              raise SystemExit(0)
+
+          def owning_crate_dirs(root_dir: Path) -> set[Path]:
+              owners = set()
+              for rel in rs_changed:
+                  p = (repo_root / rel).resolve()
+                  cur = p if p.is_dir() else p.parent
+                  while cur == root_dir or root_dir in cur.parents:
+                      if (cur / "Cargo.toml").is_file():
+                          owners.add(cur)
+                          break
+                      if cur == root_dir:
+                          break
+                      cur = cur.parent
+              return owners
+
+          if not shutil.which("cargo-machete"):
+              print("- Unavailable: `cargo-machete` is not installed.\n")
+          else:
+              for root_rel in rs_roots:
+                  root_dir = (repo_root / root_rel).resolve()
+                  targets = sorted(owning_crate_dirs(root_dir)) if is_pr else [root_dir]
+                  if is_pr and not targets:
+                      continue
+                  for t in targets:
+                      rel_t = t.relative_to(repo_root).as_posix() if t != repo_root else "."
+                      proc = subprocess.run(["cargo-machete", str(t)], capture_output=True, text=True)
+                      out = (proc.stdout or proc.stderr or "").strip()
+                      if proc.returncode == 0:
+                          print(f"- Pass (`{rel_t}`): no unused Cargo dependencies.")
+                      else:
+                          print(f"- Findings (`{rel_t}`):\n```\n" + "\n".join(out.splitlines()[:40]) + "\n```")
+              print("")
+
+          if run_clippy:
+              for root_rel in rs_roots:
+                  root_dir = (repo_root / root_rel).resolve()
+                  if is_pr and not owning_crate_dirs(root_dir):
+                      continue
+                  proc = subprocess.run(
+                      ["cargo", "clippy", "--all-targets", "--message-format=json", "--", "-W", "dead_code", "-W", "clippy::cognitive_complexity", "-W", "clippy::too_many_lines"],
+                      cwd=root_dir, capture_output=True, text=True
+                  )
+                  diags = []
+                  for line in proc.stdout.splitlines():
+                      try:
+                          msg = json.loads(line)
+                      except Exception:
+                          continue
+                      if msg.get("reason") != "compiler-message":
+                          continue
+                      m = msg.get("message", {})
+                      if m.get("level") not in ("warning", "error"):
+                          continue
+                      spans = m.get("spans") or []
+                      file_rel = None
+                      for sp in spans:
+                          fn = sp.get("file_name")
+                          if fn:
+                              fp = (root_dir / fn).resolve()
+                              try:
+                                  file_rel = fp.relative_to(repo_root).as_posix()
+                              except ValueError:
+                                  file_rel = fn
+                              break
+                      if is_pr and (not file_rel or file_rel not in changed):
+                          continue
+                      rendered = (m.get("rendered") or m.get("message") or "").strip().splitlines()[0]
+                      diags.append(f"{file_rel or root_rel}: {rendered}")
+
+                  if not diags:
+                      print(f"- Clippy pass (`{root_rel}`): no dead_code/complexity warnings in scope.\n")
+                  else:
+                      print(f"- Clippy findings (`{root_rel}`, {len(diags)}):\n```\n" + "\n".join(diags[:50]) + "\n```\n")
+          PY
